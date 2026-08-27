@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
 import os
 import sys
+import platform
 import argparse
 from pathlib import Path
 
@@ -11,10 +11,6 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 
-
-# ----------------------------------------------------------------------------
-# Basic filesystem / device helpers
-# ----------------------------------------------------------------------------
 
 def get_downloads_folder() -> Path:
     if os.name == "nt":
@@ -37,6 +33,18 @@ def get_optimal_device() -> torch.device:
     return torch.device("cpu")
 
 
+def describe_platform(device: torch.device) -> str:
+    system = platform.system()
+    os_label = {"Windows": "Windows", "Darwin": "macOS", "Linux": "Linux"}.get(system, system)
+    if device.type == "cuda":
+        gpu_label = f"NVIDIA GPU ({torch.cuda.get_device_name(0)})"
+    elif device.type == "mps":
+        gpu_label = "Apple Silicon GPU (Metal/MPS)"
+    else:
+        gpu_label = "CPU (no GPU acceleration detected - this will be slower)"
+    return f"{os_label} | {gpu_label}"
+
+
 def sanitize_path(raw_path: str) -> Path:
     cleaned = raw_path.strip().strip("'\"").strip("& '").strip()
     return Path(cleaned).expanduser().resolve()
@@ -44,7 +52,7 @@ def sanitize_path(raw_path: str) -> Path:
 
 def interactive_picture_prompt() -> Path:
     print("=" * 60)
-    print("  PISH v2 : SELECT IMAGE TO PROTECT")
+    print("  PISH-ENGIN : SELECT IMAGE TO PROTECT")
     print("=" * 60)
     print(" [1] Enter or paste the file path")
     print(" [2] Drag and drop an image file into this terminal")
@@ -99,17 +107,7 @@ def interactive_picture_prompt() -> Path:
             print(f"[x] Invalid image format: {target_path}")
 
 
-# ----------------------------------------------------------------------------
-# 1. Perceptual / texture masking
-# ----------------------------------------------------------------------------
-# Human eyes are far less sensitive to noise in high-frequency/textured
-# regions (fur, fabric, foliage, background clutter) than in smooth, flat
-# regions (skin, sky, cheeks) or near strong edges people fixate on (eyes,
-# face outline). This builds a per-pixel weight map so the perturbation
-# budget is allocated where it's least visible, instead of uniformly.
-
 def build_texture_mask(img_01: torch.Tensor, low: float = 0.35, high: float = 1.0) -> torch.Tensor:
-    """img_01: (1,3,H,W) in [0,1]. Returns a (1,3,H,W) weight map in [low, high]."""
     gray = 0.299 * img_01[:, 0:1] + 0.587 * img_01[:, 1:2] + 0.114 * img_01[:, 2:3]
     sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
                             device=img_01.device).view(1, 1, 3, 3)
@@ -123,17 +121,7 @@ def build_texture_mask(img_01: torch.Tensor, low: float = 0.35, high: float = 1.
     return mask.repeat(1, 3, 1, 1)
 
 
-# ----------------------------------------------------------------------------
-# 3. EOT (Expectation over Transformation)
-# ----------------------------------------------------------------------------
-# During each optimization step, randomly simulate what social platforms do
-# to an uploaded image (re-scale, quantize/compress, brighten, soften) and
-# compute the loss AFTER that transform. This forces the perturbation to be
-# one that still works after Instagram/WhatsApp/Facebook re-processing,
-# instead of one that only works on the exact original bytes.
-
 def eot_transform(img_pm1: torch.Tensor) -> torch.Tensor:
-    """img_pm1: (1,3,H,W) in [-1,1]."""
     x = img_pm1
     choice = torch.randint(0, 4, (1,)).item()
     if choice == 0:
@@ -157,24 +145,18 @@ def eot_transform(img_pm1: torch.Tensor) -> torch.Tensor:
     return torch.clamp(x, -1, 1)
 
 
-# ----------------------------------------------------------------------------
-# Main cloaking engine
-# ----------------------------------------------------------------------------
-
 class PishShieldV2:
-    # 2. Ensemble of VAEs - a perturbation that fools several encoders at
-    # once transfers much better to a model we never explicitly attacked.
     VAE_REPOS = [
-        "stabilityai/sd-vae-ft-mse",          # SD1.x family
-        "stabilityai/stable-diffusion-2-1",   # SD2.x family (subfolder="vae")
-        "madebyollin/sdxl-vae-fp16-fix",      # SDXL family
+        "stabilityai/sd-vae-ft-mse",
+        "stabilityai/stable-diffusion-2-1",
+        "madebyollin/sdxl-vae-fp16-fix",
     ]
 
     def __init__(self, device: torch.device = None, use_face_loss: bool = False):
         from diffusers import AutoencoderKL
 
         self.device = device or get_optimal_device()
-        print(f"[*] Device: {self.device}")
+        print(f"[*] Platform: {describe_platform(self.device)}")
         print("[*] Loading VAE ensemble (first run downloads weights, be patient)...")
 
         self.vaes = []
@@ -199,8 +181,6 @@ class PishShieldV2:
         self.to_pil = transforms.ToPILImage()
         self.loss_fn = nn.MSELoss()
 
-        # 4. Optional face-embedding attack (targets face-swap deepfake tools,
-        # which use face-recognition embeddings rather than VAE latents)
         self.use_face_loss = use_face_loss
         self.face_model = None
         self.mtcnn = None
@@ -229,28 +209,25 @@ class PishShieldV2:
 
         orig_img = Image.open(input_path).convert("RGB")
         w, h = orig_img.size
-        max_dim = 768  # a bit higher than v1 since masking lets us afford more detail
+        max_dim = 768
         if max(w, h) > max_dim:
             orig_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
             w, h = orig_img.size
         w, h = (w // 8) * 8, (h // 8) * 8
         orig_img = orig_img.resize((w, h), Image.Resampling.LANCZOS)
 
-        orig01 = self.to_tensor(orig_img).unsqueeze(0).to(self.device)      # [0,1]
-        orig_pm1 = orig01 * 2.0 - 1.0                                      # [-1,1]
+        orig01 = self.to_tensor(orig_img).unsqueeze(0).to(self.device)
+        orig_pm1 = orig01 * 2.0 - 1.0
 
-        # Perceptual mask: per-pixel eps allowance (texture -> more, flat -> less)
-        mask = build_texture_mask(orig01)                                  # (1,3,H,W) in [low, 1]
+        mask = build_texture_mask(orig01)
         eps_map = eps * mask
 
-        # Neutral target latent per VAE (encode a blank/gray image)
         target_pm1 = torch.zeros_like(orig_pm1)
         target_latents = []
         with torch.no_grad():
             for vae in self.vaes:
                 target_latents.append(vae.encode(target_pm1).latent_dist.sample())
 
-        # Reference face embedding to push away from (if enabled)
         orig_face_embedding = None
         if self.use_face_loss:
             with torch.no_grad():
@@ -264,11 +241,9 @@ class PishShieldV2:
         adv_pm1 = adv_pm1 + torch.empty_like(adv_pm1).uniform_(-1, 1) * eps_map
         adv_pm1 = torch.clamp(adv_pm1, -1.0, 1.0)
 
-        for _ in tqdm(range(steps), desc="Pish v2 ensemble attack", unit="step"):
+        for _ in tqdm(range(steps), desc="Pish-Engin ensemble attack", unit="step"):
             adv_pm1.requires_grad = True
 
-            # Randomly attack the raw image OR an EOT-transformed version,
-            # so the perturbation learns to survive re-compression too.
             if torch.rand(1).item() < eot_prob:
                 attack_input = eot_transform(adv_pm1)
             else:
@@ -277,9 +252,6 @@ class PishShieldV2:
             loss = self._multi_vae_loss(attack_input, target_latents)
 
             if self.use_face_loss and orig_face_embedding is not None:
-                # Resize to the 160x160 the face model expects, in a
-                # differentiable way, then push the embedding AWAY from the
-                # original identity embedding (maximize distance).
                 face_input = F.interpolate(attack_input, size=(160, 160),
                                             mode="bilinear", align_corners=False)
                 cur_embedding = self.face_model(face_input)
@@ -304,7 +276,7 @@ class PishShieldV2:
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="pish_v2", description="Pish v2: Multi-Model Anti-AI Image Cloak")
+    parser = argparse.ArgumentParser(prog="Pish-Engin", description="Pish-Engin: Multi-Model Anti-AI Image Cloak")
     parser.add_argument("-i", "--input", type=str, default=None, help="Input photo path")
     parser.add_argument("-o", "--output", type=str, default=None, help="Output path")
     parser.add_argument("-s", "--strength", choices=["low", "medium", "high"], default="medium")
@@ -319,7 +291,7 @@ def main():
         output_path = sanitize_path(args.output)
     else:
         downloads_dir = get_downloads_folder()
-        output_path = downloads_dir / f"{input_path.stem}_pish_v2.png"
+        output_path = downloads_dir / f"{input_path.stem}_pish_engin.png"
 
     strength_config = {
         "low": 0.03,
